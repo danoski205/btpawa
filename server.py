@@ -44,7 +44,6 @@ last_seen_form = {}
 
 # ================= HELPERS =================
 def create_session():
-    """Create a requests session with retry strategy"""
     session = requests.Session()
     retry_strategy = Retry(
         total=MAX_RETRIES,
@@ -56,11 +55,10 @@ def create_session():
     session.mount("https://", adapter)
     return session
 
-
 def get_current_season(session):
     """
-    Fetch the latest season from /seasons/list/actual
-    and add +1 to get the current/live season ID.
+    Fetch the latest actual season that has matches played,
+    then add +1 to form the current/live season.
     """
     try:
         url = f"{BASE_URL}/seasons/list/actual"
@@ -72,16 +70,37 @@ def get_current_season(session):
             logger.error("No seasons returned from /seasons/list/actual")
             return None
 
-        # pick the latest season by ID
-        latest_season_id = max(int(season["id"]) for season in items)
-        current_live_season_id = latest_season_id + 1  # follow your +1 pattern
-        logger.info(f"Using current/live season: #{current_live_season_id} (latest actual season: #{latest_season_id})")
+        # Sort seasons descending by ID to start from latest
+        seasons_sorted = sorted(items, key=lambda x: int(x["id"]), reverse=True)
+
+        # Find the latest season that has standings with at least one form
+        latest_valid_season_id = None
+        for season in seasons_sorted:
+            season_id = season.get("id")
+            try:
+                standings_url = f"{BASE_URL}/standings/by-season/{season_id}"
+                sr = session.get(standings_url, headers=HEADERS, timeout=TIMEOUT)
+                sr.raise_for_status()
+                sdata = sr.json()
+                participant_standings = sdata.get("competitionStandings", [{}])[0].get("participantStandings", [])
+                if participant_standings and any(t.get("form") for t in participant_standings):
+                    latest_valid_season_id = int(season_id)
+                    break
+            except Exception:
+                continue  # skip seasons that fail or have no standings
+
+        if not latest_valid_season_id:
+            logger.warning("No completed/active season found. Cannot determine current season.")
+            return None
+
+        # Add +1 to get current/live season
+        current_live_season_id = latest_valid_season_id + 1
+        logger.info(f"Using current/live season: #{current_live_season_id} (latest completed season: #{latest_valid_season_id})")
         return str(current_live_season_id)
 
     except Exception as e:
         logger.error(f"Failed to fetch current season: {e}")
         return None
-
 
 def get_top5_team_forms(session, season_id):
     """Fetch top 5 teams and their forms"""
@@ -110,7 +129,6 @@ def get_top5_team_forms(session, season_id):
         logger.error(f"Failed to fetch standings: {e}")
         return []
 
-
 def sleep_until_next_check():
     """Align checks to 2 minutes after each 5-minute interval"""
     try:
@@ -128,7 +146,6 @@ def sleep_until_next_check():
     except Exception as e:
         logger.error(f"Error in sleep_until_next_check: {e}")
         time.sleep(300)
-
 
 # ================= MAIN LOOP =================
 def main():
@@ -156,17 +173,16 @@ def main():
                 consecutive_errors += 1
                 continue
 
-            consecutive_errors = 0  # reset after successful retrieval
+            consecutive_errors = 0
 
             found_dd = False
             for t in teams:
                 team = t["team"]
-                form = t["form"][-2:] if t["form"] else []  # last 2 matches
+                form = t["form"][-2:] if t["form"] else []
 
                 key = f"{season_id}:{team}"
                 previous = last_seen_form.get(key)
 
-                # Detect new D,D
                 if form == ["D", "D"] and previous != ["D", "D"]:
                     timestamp = datetime.now(TIMEZONE).strftime('%H:%M:%S')
                     alert_msg = f"🚨 ALERT 🚨 | {team} has D,D | Season {season_id} | Time {timestamp}"

@@ -8,27 +8,28 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ================= LOGGING SETUP =================
+# Render best practice: log to stdout only
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('betpawa_monitor.log')
-    ]
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 # ================= CONFIG =================
 
-BASE_URL = os.getenv("BETPAWA_BASE_URL", "https://www.betpawa.ng/api/sportsbook/virtual/v1")
+BASE_URL = os.getenv(
+    "BETPAWA_BASE_URL",
+    "https://www.betpawa.ng/api/sportsbook/virtual/v1"
+)
+
 TIMEZONE_STR = os.getenv("TIMEZONE", "Africa/Lagos")
 TIMEOUT = int(os.getenv("API_TIMEOUT", "10"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "application/json",
 }
 
 try:
@@ -37,81 +38,72 @@ except pytz.exceptions.UnknownTimeZoneError:
     logger.error(f"Invalid timezone: {TIMEZONE_STR}. Using UTC.")
     TIMEZONE = pytz.UTC
 
-# store last seen 2-form per season+team
+# store last seen 2-form per team
 last_seen_form = {}
 
-# =========================================
-
+# ================= SESSION =================
 
 def create_session():
-    """Create a requests session with retry strategy"""
     session = requests.Session()
+
     retry_strategy = Retry(
         total=MAX_RETRIES,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
     )
+
     adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("http://", adapter)
     session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
     return session
 
+# ================= DATA FETCH =================
 
-def get_current_season(session):
-    """Fetch current season ID"""
+def get_top5_team_forms(session):
+    """
+    Fetch top 5 teams and their form directly from standings.
+    No season endpoint is used (confirmed unavailable).
+    """
     try:
-        url = f"{BASE_URL}/seasons/list/current"
-        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        
-        if "id" not in data:
-            logger.error(f"Season ID not found in response: {data}")
-            return None
-            
-        return data["id"]
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to get current season: {e}")
-        return None
-
-
-def get_top5_team_forms(session, season_id):
-    """Fetch top 5 teams and their forms"""
-    try:
-        url = f"{BASE_URL}/standings/by-season/{season_id}"
+        url = f"{BASE_URL}/standings"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
-        # Safety checks
-        if "competitionStandings" not in data or not data["competitionStandings"]:
-            logger.warning(f"No competition standings found for season {season_id}")
-            return []
-        
-        if "participantStandings" not in data["competitionStandings"][0]:
-            logger.warning(f"No participant standings found for season {season_id}")
+        competition = data.get("competitionStandings")
+        if not competition:
+            logger.warning("No competition standings found")
             return []
 
-        teams = data["competitionStandings"][0]["participantStandings"][:5]
+        participants = competition[0].get("participantStandings")
+        if not participants:
+            logger.warning("No participant standings found")
+            return []
+
+        top5 = participants[:5]
 
         return [
             {
                 "team": t.get("name", "Unknown"),
-                "form": t.get("form", [])
+                "form": t.get("form", []),
             }
-            for t in teams
+            for t in top5
         ]
+
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to get team forms: {e}")
+        logger.error(f"Failed to fetch standings: {e}")
         return []
-    except (KeyError, IndexError) as e:
-        logger.error(f"Unexpected data structure: {e}")
+    except (KeyError, IndexError, TypeError) as e:
+        logger.error(f"Unexpected response structure: {e}")
         return []
 
+# ================= CLOCK ALIGN =================
 
 def sleep_until_next_check():
     """
-    Align checks to exactly:
+    Align checks to:
     :02 :07 :12 :17 :22 :27 :32 :37 :42 :47 :52 :57
     """
     try:
@@ -121,25 +113,23 @@ def sleep_until_next_check():
         base_time = now.replace(minute=base_minute, second=0, microsecond=0)
 
         check_time = base_time + timedelta(minutes=2)
-
         if check_time <= now:
             check_time += timedelta(minutes=5)
 
         sleep_seconds = (check_time - now).total_seconds()
-        
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
-    except Exception as e:
-        logger.error(f"Error in sleep_until_next_check: {e}")
-        time.sleep(300)  # Default 5-minute sleep
 
+    except Exception as e:
+        logger.error(f"Sleep alignment error: {e}")
+        time.sleep(300)
 
 # ================= MAIN LOOP =================
 
 def main():
-    logger.info("✅ Betpawa DD Monitor Started (Clock-Aligned)")
+    logger.info("✅ Betpawa DD Monitor Started")
     session = create_session()
-    
+
     consecutive_errors = 0
     max_consecutive_errors = 5
 
@@ -147,47 +137,41 @@ def main():
         try:
             sleep_until_next_check()
 
-            season_id = get_current_season(session)
-            if season_id is None:
+            teams = get_top5_team_forms(session)
+            if not teams:
                 consecutive_errors += 1
+                logger.warning("No teams retrieved")
                 if consecutive_errors >= max_consecutive_errors:
-                    logger.critical(f"Too many errors ({consecutive_errors}). Restarting session...")
+                    logger.critical("Too many errors, recreating session")
                     session = create_session()
                     consecutive_errors = 0
                 continue
 
-            teams = get_top5_team_forms(session, season_id)
-            if not teams:
-                logger.warning("No teams retrieved")
-                consecutive_errors += 1
-                continue
-
-            consecutive_errors = 0  # Reset on successful retrieval
+            consecutive_errors = 0
 
             for t in teams:
                 team = t["team"]
                 form = t["form"][:2] if t["form"] else []
 
-                key = f"{season_id}:{team}"
-                previous = last_seen_form.get(key)
+                previous = last_seen_form.get(team)
 
                 # Detect NEW D,D only
                 if form == ["D", "D"] and previous != ["D", "D"]:
-                    timestamp = datetime.now(TIMEZONE).strftime('%H:%M:%S')
-                    alert_msg = f"🚨 ALERT 🚨 | {team} has D,D | Season {season_id} | Time {timestamp}"
-                    logger.warning(alert_msg)
-                    print(alert_msg)  # Also print to stdout for visibility
+                    timestamp = datetime.now(TIMEZONE).strftime("%H:%M:%S")
+                    msg = f"🚨 ALERT 🚨 | {team} has D,D | Time {timestamp}"
+                    logger.warning(msg)
+                    print(msg)
 
-                last_seen_form[key] = form
+                last_seen_form[team] = form
 
         except KeyboardInterrupt:
             logger.info("Monitor stopped by user")
             break
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
-            consecutive_errors += 1
-            time.sleep(60)  # Wait before retrying
+            logger.error("Unexpected error in main loop", exc_info=True)
+            time.sleep(60)
 
+# ================= ENTRY =================
 
 if __name__ == "__main__":
     main()

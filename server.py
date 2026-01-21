@@ -59,18 +59,26 @@ def create_session():
 
 
 def get_current_season(session):
-    """Fetch the currently live/active season that's actually playing"""
+    """Fetch the currently live/active season from actual seasons list"""
     try:
-        url = f"{BASE_URL}/seasons/list/current"
+        url = f"{BASE_URL}/seasons/list/actual"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
         
-        season_id = data.get("id")
-        season_name = data.get("name", "Unknown")
+        items = data.get("items", [])
+        
+        if not items:
+            logger.error("No seasons found in actual seasons list")
+            return None
+
+        # First item in actual seasons is the currently playing one
+        current_season = items[0]
+        season_id = current_season.get("id")
+        season_name = current_season.get("name", "Unknown")
         
         if not season_id:
-            logger.error(f"Season ID not found in response: {data}")
+            logger.error(f"Season ID not found in response: {current_season}")
             return None
 
         logger.info(f"Current live season: #{season_id} ({season_name})")

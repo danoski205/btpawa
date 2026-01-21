@@ -59,27 +59,22 @@ def create_session():
 
 
 def get_current_season(session):
-    """Get latest season ID from actual seasons and add +1 to form current/live season ID"""
+    """Fetch the currently live/active season that's actually playing"""
     try:
-        url = f"{BASE_URL}/seasons/list/actual"
+        url = f"{BASE_URL}/seasons/list/current"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
-        items = data.get("items", [])
         
-        if not items:
-            logger.error("No seasons returned in items")
+        season_id = data.get("id")
+        season_name = data.get("name", "Unknown")
+        
+        if not season_id:
+            logger.error(f"Season ID not found in response: {data}")
             return None
 
-        # Pick the season with the highest ID (latest actual season)
-        latest_season = max(items, key=lambda x: int(x["id"]))
-        latest_id = int(latest_season.get("id"))
-        latest_name = latest_season.get("name", "Unknown")
-
-        # Add 1 to get current/live season
-        current_live_id = latest_id + 1
-        logger.info(f"Latest actual season: #{latest_id} ({latest_name}) | Using current/live season: #{current_live_id}")
-        return str(current_live_id)
+        logger.info(f"Current live season: #{season_id} ({season_name})")
+        return str(season_id)
         
     except Exception as e:
         logger.error(f"Failed to fetch current season: {e}")

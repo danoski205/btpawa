@@ -59,7 +59,7 @@ def create_session():
 
 
 def get_current_season(session):
-    """Fetch the currently live/active season from actual seasons list"""
+    """Fetch the base season from actual seasons list and add 1 for the live season"""
     try:
         url = f"{BASE_URL}/seasons/list/actual"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
@@ -72,17 +72,19 @@ def get_current_season(session):
             logger.error("No seasons found in actual seasons list")
             return None
 
-        # First item in actual seasons is the currently playing one
-        current_season = items[0]
-        season_id = current_season.get("id")
-        season_name = current_season.get("name", "Unknown")
+        # First item in actual seasons
+        base_season = items[0]
+        base_season_id = base_season.get("id")
+        base_season_name = base_season.get("name", "Unknown")
         
-        if not season_id:
-            logger.error(f"Season ID not found in response: {current_season}")
+        if not base_season_id:
+            logger.error(f"Season ID not found in response: {base_season}")
             return None
 
-        logger.info(f"Current live season: #{season_id} ({season_name})")
-        return str(season_id)
+        # Add 1 to get the live season
+        live_season_id = int(base_season_id) + 1
+        logger.info(f"Base season: #{base_season_id} ({base_season_name}) | Live season for DD check: #{live_season_id}")
+        return str(live_season_id)
         
     except Exception as e:
         logger.error(f"Failed to fetch current season: {e}")
@@ -90,7 +92,7 @@ def get_current_season(session):
 
 
 def get_top5_team_forms(session, season_id):
-    """Fetch top 5 teams and their forms"""
+    """Fetch top 5 teams and their forms for DD detection"""
     try:
         url = f"{BASE_URL}/standings/by-season/{season_id}"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
@@ -99,14 +101,15 @@ def get_top5_team_forms(session, season_id):
 
         # Safety checks
         if "competitionStandings" not in data or not data["competitionStandings"]:
-            logger.warning(f"No competition standings found for season {season_id}")
+            logger.warning(f"❌ DD data NOT found for season {season_id} - No competition standings")
             return []
         
         if "participantStandings" not in data["competitionStandings"][0]:
-            logger.warning(f"No participant standings found for season {season_id}")
+            logger.warning(f"❌ DD data NOT found for season {season_id} - No participant standings")
             return []
 
         teams = data["competitionStandings"][0]["participantStandings"][:5]
+        logger.info(f"✅ DD data FOUND for season {season_id} - Monitoring {len(teams)} teams for D,D forms")
 
         return [
             {
@@ -116,10 +119,10 @@ def get_top5_team_forms(session, season_id):
             for t in teams
         ]
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to get team forms: {e}")
+        logger.error(f"❌ Failed to get DD data for season {season_id}: {e}")
         return []
     except (KeyError, IndexError) as e:
-        logger.error(f"Unexpected data structure: {e}")
+        logger.error(f"❌ Unexpected data structure when fetching DD data: {e}")
         return []
 
 

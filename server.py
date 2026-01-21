@@ -43,7 +43,6 @@ except pytz.exceptions.UnknownTimeZoneError:
 last_seen_form = {}
 
 # ================= HELPERS =================
-
 def create_session():
     """Create a requests session with retry strategy"""
     session = requests.Session()
@@ -57,28 +56,30 @@ def create_session():
     session.mount("https://", adapter)
     return session
 
-def get_latest_season(session):
-    """Get the latest season by ID (most recent)"""
+def get_current_season(session):
+    """Get latest season ID and add +1 to form current/live season ID"""
     try:
         url = f"{BASE_URL}/seasons/list/actual"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
-
         items = data.get("items", [])
         if not items:
             logger.error("No seasons returned in items")
             return None
 
-        # pick season with highest ID (latest)
+        # pick the season with the highest ID
         latest_season = max(items, key=lambda x: int(x["id"]))
-        season_id = latest_season.get("id")
-        season_name = latest_season.get("name", "Unknown")
-        logger.info(f"Using latest season: {season_name} | ID: {season_id}")
-        return season_id
+        latest_id = int(latest_season.get("id"))
+        latest_name = latest_season.get("name", "Unknown")
+
+        # +1 to get current/live season
+        current_live_id = latest_id + 1
+        logger.info(f"Using current/live season: #{current_live_id} (latest actual season: #{latest_id})")
+        return str(current_live_id)
 
     except Exception as e:
-        logger.error(f"Failed to fetch latest season: {e}")
+        logger.error(f"Failed to fetch current season: {e}")
         return None
 
 def get_top5_team_forms(session, season_id):
@@ -137,7 +138,7 @@ def main():
         try:
             sleep_until_next_check()
 
-            season_id = get_latest_season(session)
+            season_id = get_current_season(session)
             if not season_id:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:

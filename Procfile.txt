@@ -1,1 +1,1 @@
-worker: python betpawa_monitor.py
+worker: python server.py

@@ -43,7 +43,9 @@ except pytz.exceptions.UnknownTimeZoneError:
 last_seen_form = {}
 
 # ================= HELPERS =================
+
 def create_session():
+    """Create a requests session with retry strategy"""
     session = requests.Session()
     retry_strategy = Retry(
         total=MAX_RETRIES,
@@ -55,51 +57,28 @@ def create_session():
     session.mount("https://", adapter)
     return session
 
-def get_current_season(session):
-    """
-    Fetch the latest actual season that has matches played,
-    then add +1 to form the current/live season.
-    """
+def get_latest_season(session):
+    """Get the latest season by ID (most recent)"""
     try:
         url = f"{BASE_URL}/seasons/list/actual"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
+
         items = data.get("items", [])
         if not items:
-            logger.error("No seasons returned from /seasons/list/actual")
+            logger.error("No seasons returned in items")
             return None
 
-        # Sort seasons descending by ID to start from latest
-        seasons_sorted = sorted(items, key=lambda x: int(x["id"]), reverse=True)
-
-        # Find the latest season that has standings with at least one form
-        latest_valid_season_id = None
-        for season in seasons_sorted:
-            season_id = season.get("id")
-            try:
-                standings_url = f"{BASE_URL}/standings/by-season/{season_id}"
-                sr = session.get(standings_url, headers=HEADERS, timeout=TIMEOUT)
-                sr.raise_for_status()
-                sdata = sr.json()
-                participant_standings = sdata.get("competitionStandings", [{}])[0].get("participantStandings", [])
-                if participant_standings and any(t.get("form") for t in participant_standings):
-                    latest_valid_season_id = int(season_id)
-                    break
-            except Exception:
-                continue  # skip seasons that fail or have no standings
-
-        if not latest_valid_season_id:
-            logger.warning("No completed/active season found. Cannot determine current season.")
-            return None
-
-        # Add +1 to get current/live season
-        current_live_season_id = latest_valid_season_id + 1
-        logger.info(f"Using current/live season: #{current_live_season_id} (latest completed season: #{latest_valid_season_id})")
-        return str(current_live_season_id)
+        # pick season with highest ID (latest)
+        latest_season = max(items, key=lambda x: int(x["id"]))
+        season_id = latest_season.get("id")
+        season_name = latest_season.get("name", "Unknown")
+        logger.info(f"Using latest season: {season_name} | ID: {season_id}")
+        return season_id
 
     except Exception as e:
-        logger.error(f"Failed to fetch current season: {e}")
+        logger.error(f"Failed to fetch latest season: {e}")
         return None
 
 def get_top5_team_forms(session, season_id):
@@ -158,7 +137,7 @@ def main():
         try:
             sleep_until_next_check()
 
-            season_id = get_current_season(session)
+            season_id = get_latest_season(session)
             if not season_id:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
@@ -173,16 +152,17 @@ def main():
                 consecutive_errors += 1
                 continue
 
-            consecutive_errors = 0
+            consecutive_errors = 0  # reset after successful retrieval
 
             found_dd = False
             for t in teams:
                 team = t["team"]
-                form = t["form"][-2:] if t["form"] else []
+                form = t["form"][-2:] if t["form"] else []  # last 2 matches
 
                 key = f"{season_id}:{team}"
                 previous = last_seen_form.get(key)
 
+                # Detect new D,D
                 if form == ["D", "D"] and previous != ["D", "D"]:
                     timestamp = datetime.now(TIMEZONE).strftime('%H:%M:%S')
                     alert_msg = f"🚨 ALERT 🚨 | {team} has D,D | Season {season_id} | Time {timestamp}"
@@ -202,7 +182,6 @@ def main():
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
             consecutive_errors += 1
             time.sleep(60)
-
 
 if __name__ == "__main__":
     main()

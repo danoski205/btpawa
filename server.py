@@ -43,7 +43,6 @@ except pytz.exceptions.UnknownTimeZoneError:
 last_seen_form = {}
 
 # ================= HELPERS =================
-
 def create_session():
     """Create a requests session with retry strategy"""
     session = requests.Session()
@@ -57,29 +56,40 @@ def create_session():
     session.mount("https://", adapter)
     return session
 
-def get_latest_season(session):
-    """Get the latest season by ID (most recent)"""
+
+def get_active_season(session):
+    """Get the actual season that has started (participantStandings with forms)"""
     try:
         url = f"{BASE_URL}/seasons/list/actual"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
-
         items = data.get("items", [])
         if not items:
-            logger.error("No seasons returned in items")
+            logger.error("No actual seasons returned")
             return None
 
-        # pick season with highest ID (latest)
-        latest_season = max(items, key=lambda x: int(x["id"]))
-        season_id = latest_season.get("id")
-        season_name = latest_season.get("name", "Unknown")
-        logger.info(f"Using latest season: {season_name} | ID: {season_id}")
-        return season_id
+        for season in items:
+            season_id = season.get("id")
+            season_name = season.get("name", "Unknown")
+
+            # Check if this season has participantStandings with forms
+            standings_url = f"{BASE_URL}/standings/by-season/{season_id}"
+            sr = session.get(standings_url, headers=HEADERS, timeout=TIMEOUT)
+            sr.raise_for_status()
+            sdata = sr.json()
+            participant_standings = sdata.get("competitionStandings", [{}])[0].get("participantStandings", [])
+            if participant_standings and any(t.get("form") for t in participant_standings):
+                logger.info(f"Using active season: {season_name} | ID: {season_id}")
+                return season_id
+
+        logger.warning("No active season with forms found")
+        return None
 
     except Exception as e:
-        logger.error(f"Failed to fetch latest season: {e}")
+        logger.error(f"Failed to fetch active season: {e}")
         return None
+
 
 def get_top5_team_forms(session, season_id):
     """Fetch top 5 teams and their forms"""
@@ -108,6 +118,7 @@ def get_top5_team_forms(session, season_id):
         logger.error(f"Failed to fetch standings: {e}")
         return []
 
+
 def sleep_until_next_check():
     """Align checks to 2 minutes after each 5-minute interval"""
     try:
@@ -126,6 +137,7 @@ def sleep_until_next_check():
         logger.error(f"Error in sleep_until_next_check: {e}")
         time.sleep(300)
 
+
 # ================= MAIN LOOP =================
 def main():
     logger.info("✅ Betpawa DD Monitor Started")
@@ -137,7 +149,7 @@ def main():
         try:
             sleep_until_next_check()
 
-            season_id = get_latest_season(session)
+            season_id = get_active_season(session)
             if not season_id:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
@@ -182,6 +194,7 @@ def main():
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
             consecutive_errors += 1
             time.sleep(60)
+
 
 if __name__ == "__main__":
     main()

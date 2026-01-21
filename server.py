@@ -57,8 +57,11 @@ def create_session():
     return session
 
 
-def get_active_season(session):
-    """Get the currently active season (latest season that has matches played)"""
+def get_current_season(session):
+    """
+    Fetch the latest season from /seasons/list/actual
+    and add +1 to get the current/live season ID.
+    """
     try:
         url = f"{BASE_URL}/seasons/list/actual"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
@@ -66,38 +69,17 @@ def get_active_season(session):
         data = r.json()
         items = data.get("items", [])
         if not items:
-            logger.error("No actual seasons returned")
+            logger.error("No seasons returned from /seasons/list/actual")
             return None
 
-        valid_seasons = []
-
-        # loop through all actual seasons and check which has participantStandings with forms
-        for season in items:
-            season_id = season.get("id")
-            season_name = season.get("name", "Unknown")
-
-            try:
-                standings_url = f"{BASE_URL}/standings/by-season/{season_id}"
-                sr = session.get(standings_url, headers=HEADERS, timeout=TIMEOUT)
-                sr.raise_for_status()
-                sdata = sr.json()
-                participant_standings = sdata.get("competitionStandings", [{}])[0].get("participantStandings", [])
-                if participant_standings and any(t.get("form") for t in participant_standings):
-                    valid_seasons.append((int(season_id), season_name))
-            except Exception:
-                continue  # skip seasons that fail
-
-        if not valid_seasons:
-            logger.warning("No active season with matches found")
-            return None
-
-        # pick the season with the highest ID (latest live season)
-        latest_season_id, latest_season_name = max(valid_seasons, key=lambda x: x[0])
-        logger.info(f"Using active season: {latest_season_name} | ID: {latest_season_id}")
-        return str(latest_season_id)
+        # pick the latest season by ID
+        latest_season_id = max(int(season["id"]) for season in items)
+        current_live_season_id = latest_season_id + 1  # follow your +1 pattern
+        logger.info(f"Using current/live season: #{current_live_season_id} (latest actual season: #{latest_season_id})")
+        return str(current_live_season_id)
 
     except Exception as e:
-        logger.error(f"Failed to fetch active season: {e}")
+        logger.error(f"Failed to fetch current season: {e}")
         return None
 
 
@@ -159,7 +141,7 @@ def main():
         try:
             sleep_until_next_check()
 
-            season_id = get_active_season(session)
+            season_id = get_current_season(session)
             if not season_id:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:

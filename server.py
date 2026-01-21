@@ -8,28 +8,29 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ================= LOGGING SETUP =================
-# Render best practice: log to stdout only
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('betpawa_monitor.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
 # ================= CONFIG =================
-
 BASE_URL = os.getenv(
     "BETPAWA_BASE_URL",
     "https://www.betpawa.ng/api/sportsbook/virtual/v1"
 )
-
 TIMEZONE_STR = os.getenv("TIMEZONE", "Africa/Lagos")
 TIMEOUT = int(os.getenv("API_TIMEOUT", "10"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
+    "x-pawa-brand": "betpawa-nigeria"
 }
 
 try:
@@ -38,77 +39,86 @@ except pytz.exceptions.UnknownTimeZoneError:
     logger.error(f"Invalid timezone: {TIMEZONE_STR}. Using UTC.")
     TIMEZONE = pytz.UTC
 
-# store last seen 2-form per team
+# store last seen 2-form per season+team
 last_seen_form = {}
 
-# ================= SESSION =================
+# ================= HELPERS =================
 
 def create_session():
+    """Create a requests session with retry strategy"""
     session = requests.Session()
-
     retry_strategy = Retry(
         total=MAX_RETRIES,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
     )
-
     adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("https://", adapter)
     session.mount("http://", adapter)
-
+    session.mount("https://", adapter)
     return session
 
-# ================= DATA FETCH =================
 
-def get_top5_team_forms(session):
-    """
-    Fetch top 5 teams and their form directly from standings.
-    No season endpoint is used (confirmed unavailable).
-    """
+def get_actual_season(session):
+    """Get the actual (active) seasons and return the first one (English League)"""
     try:
-        url = f"{BASE_URL}/standings"
+        url = f"{BASE_URL}/seasons/list/actual"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
-        competition = data.get("competitionStandings")
-        if not competition:
-            logger.warning("No competition standings found")
+        if not data or len(data) == 0:
+            logger.error("No actual seasons returned")
+            return None
+
+        # English League is always the first in the list
+        first_season = data[0]
+        season_id = first_season.get("id")
+        season_name = first_season.get("name", "Unknown")
+        logger.info(f"Using season: {season_name} | ID: {season_id}")
+        return season_id
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch actual season: {e}")
+        return None
+
+
+def get_top5_team_forms(session, season_id):
+    """Fetch top 5 teams and their forms"""
+    try:
+        url = f"{BASE_URL}/standings/by-season/{season_id}"
+        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+
+        if "competitionStandings" not in data or not data["competitionStandings"]:
+            logger.warning(f"No competition standings found for season {season_id}")
             return []
 
-        participants = competition[0].get("participantStandings")
-        if not participants:
-            logger.warning("No participant standings found")
+        if "participantStandings" not in data["competitionStandings"][0]:
+            logger.warning(f"No participant standings found for season {season_id}")
             return []
 
-        top5 = participants[:5]
+        teams = data["competitionStandings"][0]["participantStandings"][:5]
 
         return [
             {
                 "team": t.get("name", "Unknown"),
-                "form": t.get("form", []),
+                "form": t.get("form", [])
             }
-            for t in top5
+            for t in teams
         ]
-
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch standings: {e}")
         return []
-    except (KeyError, IndexError, TypeError) as e:
-        logger.error(f"Unexpected response structure: {e}")
+    except (KeyError, IndexError) as e:
+        logger.error(f"Unexpected data structure: {e}")
         return []
 
-# ================= CLOCK ALIGN =================
 
 def sleep_until_next_check():
-    """
-    Align checks to:
-    :02 :07 :12 :17 :22 :27 :32 :37 :42 :47 :52 :57
-    """
+    """Align checks to 2 minutes after each 5-minute interval"""
     try:
         now = datetime.now(TIMEZONE)
-
         base_minute = (now.minute // 5) * 5
         base_time = now.replace(minute=base_minute, second=0, microsecond=0)
 
@@ -119,17 +129,15 @@ def sleep_until_next_check():
         sleep_seconds = (check_time - now).total_seconds()
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
-
     except Exception as e:
-        logger.error(f"Sleep alignment error: {e}")
+        logger.error(f"Error in sleep_until_next_check: {e}")
         time.sleep(300)
 
-# ================= MAIN LOOP =================
 
+# ================= MAIN LOOP =================
 def main():
     logger.info("✅ Betpawa DD Monitor Started")
     session = create_session()
-
     consecutive_errors = 0
     max_consecutive_errors = 5
 
@@ -137,41 +145,47 @@ def main():
         try:
             sleep_until_next_check()
 
-            teams = get_top5_team_forms(session)
-            if not teams:
+            season_id = get_actual_season(session)
+            if not season_id:
                 consecutive_errors += 1
-                logger.warning("No teams retrieved")
                 if consecutive_errors >= max_consecutive_errors:
-                    logger.critical("Too many errors, recreating session")
+                    logger.critical(f"Too many errors ({consecutive_errors}). Restarting session...")
                     session = create_session()
                     consecutive_errors = 0
                 continue
 
-            consecutive_errors = 0
+            teams = get_top5_team_forms(session, season_id)
+            if not teams:
+                logger.warning("No teams retrieved")
+                consecutive_errors += 1
+                continue
+
+            consecutive_errors = 0  # reset after successful retrieval
 
             for t in teams:
                 team = t["team"]
                 form = t["form"][:2] if t["form"] else []
 
-                previous = last_seen_form.get(team)
+                key = f"{season_id}:{team}"
+                previous = last_seen_form.get(key)
 
-                # Detect NEW D,D only
+                # Detect new D,D
                 if form == ["D", "D"] and previous != ["D", "D"]:
-                    timestamp = datetime.now(TIMEZONE).strftime("%H:%M:%S")
-                    msg = f"🚨 ALERT 🚨 | {team} has D,D | Time {timestamp}"
-                    logger.warning(msg)
-                    print(msg)
+                    timestamp = datetime.now(TIMEZONE).strftime('%H:%M:%S')
+                    alert_msg = f"🚨 ALERT 🚨 | {team} has D,D | Season {season_id} | Time {timestamp}"
+                    logger.warning(alert_msg)
+                    print(alert_msg)
 
-                last_seen_form[team] = form
+                last_seen_form[key] = form
 
         except KeyboardInterrupt:
             logger.info("Monitor stopped by user")
             break
         except Exception as e:
-            logger.error("Unexpected error in main loop", exc_info=True)
+            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+            consecutive_errors += 1
             time.sleep(60)
 
-# ================= ENTRY =================
 
 if __name__ == "__main__":
     main()

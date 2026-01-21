@@ -21,7 +21,10 @@ logger = logging.getLogger(__name__)
 
 # ================= CONFIG =================
 
-BASE_URL = os.getenv("BETPAWA_BASE_URL", "https://www.betpawa.ng/api/sportsbook/virtual/v1")
+BASE_URL = os.getenv(
+    "BETPAWA_BASE_URL",
+    "https://www.betpawa.ng/api/sportsbook/virtual/v1"
+)
 TIMEZONE_STR = os.getenv("TIMEZONE", "Africa/Lagos")
 TIMEOUT = int(os.getenv("API_TIMEOUT", "10"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
@@ -41,11 +44,9 @@ except pytz.exceptions.UnknownTimeZoneError:
 # store last seen 2-form per season+team
 last_seen_form = {}
 
-# =========================================
-
+# ================= HELPERS =================
 
 def create_session():
-    """Create a requests session with retry strategy"""
     session = requests.Session()
     retry_strategy = Retry(
         total=MAX_RETRIES,
@@ -65,51 +66,43 @@ def get_current_season(session):
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
-        
+
         items = data.get("items", [])
-        
         if not items:
             logger.error("No seasons found in actual seasons list")
             return None
 
-        # First item in actual seasons
         base_season = items[0]
         base_season_id = base_season.get("id")
         base_season_name = base_season.get("name", "Unknown")
-        
-        if not base_season_id:
-            logger.error(f"Season ID not found in response: {base_season}")
-            return None
 
-        # Add 1 to get the live season
         live_season_id = int(base_season_id) + 1
-        logger.info(f"Base season: #{base_season_id} ({base_season_name}) | Live season for DD check: #{live_season_id}")
+        logger.info(
+            f"Base season: #{base_season_id} ({base_season_name}) | "
+            f"Live season for DD check: #{live_season_id}"
+        )
         return str(live_season_id)
-        
+
     except Exception as e:
         logger.error(f"Failed to fetch current season: {e}")
         return None
 
 
 def get_top5_team_forms(session, season_id):
-    """Fetch top 5 teams and their forms for DD detection"""
+    """Fetch top 5 teams and their forms"""
     try:
         url = f"{BASE_URL}/standings/by-season/{season_id}"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
-        # Safety checks
-        if "competitionStandings" not in data or not data["competitionStandings"]:
-            logger.warning(f"❌ DD data NOT found for season {season_id} - No competition standings")
-            return []
-        
-        if "participantStandings" not in data["competitionStandings"][0]:
-            logger.warning(f"❌ DD data NOT found for season {season_id} - No participant standings")
+        standings = data.get("competitionStandings")
+        if not standings or "participantStandings" not in standings[0]:
+            logger.warning(f"❌ DD data NOT found for season {season_id}")
             return []
 
-        teams = data["competitionStandings"][0]["participantStandings"][:5]
-        logger.info(f"✅ DD data FOUND for season {season_id} - Monitoring {len(teams)} teams for D,D forms")
+        teams = standings[0]["participantStandings"][:5]
+        logger.info(f"✅ DD data FOUND for season {season_id} - Monitoring {len(teams)} teams")
 
         return [
             {
@@ -118,92 +111,70 @@ def get_top5_team_forms(session, season_id):
             }
             for t in teams
         ]
-    except requests.exceptions.RequestException as e:
-        logger.error(f"❌ Failed to get DD data for season {season_id}: {e}")
-        return []
-    except (KeyError, IndexError) as e:
-        logger.error(f"❌ Unexpected data structure when fetching DD data: {e}")
+
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch standings: {e}")
         return []
 
 
 def sleep_until_next_check():
-    """
-    Align checks to exactly:
-    :02 :07 :12 :17 :22 :27 :32 :37 :42 :47 :52 :57
-    """
+    """Align checks to :02 :07 :12 :17 :22 :27 :32 :37 :42 :47 :52 :57"""
     try:
         now = datetime.now(TIMEZONE)
-
         base_minute = (now.minute // 5) * 5
         base_time = now.replace(minute=base_minute, second=0, microsecond=0)
 
         check_time = base_time + timedelta(minutes=2)
-
         if check_time <= now:
             check_time += timedelta(minutes=5)
 
-        sleep_seconds = (check_time - now).total_seconds()
-        
-        if sleep_seconds > 0:
-            time.sleep(sleep_seconds)
+        time.sleep(max(0, (check_time - now).total_seconds()))
     except Exception as e:
-        logger.error(f"Error in sleep_until_next_check: {e}")
-        time.sleep(300)  # Default 5-minute sleep
-
+        logger.error(f"Sleep alignment error: {e}")
+        time.sleep(300)
 
 # ================= MAIN LOOP =================
 
 def main():
     logger.info("✅ Betpawa DD Monitor Started (Clock-Aligned)")
     session = create_session()
-    
-    consecutive_errors = 0
-    max_consecutive_errors = 5
 
     while True:
         try:
             sleep_until_next_check()
 
             season_id = get_current_season(session)
-            if season_id is None:
-                consecutive_errors += 1
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.critical(f"Too many errors ({consecutive_errors}). Restarting session...")
-                    session = create_session()
-                    consecutive_errors = 0
+            if not season_id:
                 continue
 
             teams = get_top5_team_forms(session, season_id)
             if not teams:
-                logger.warning("No teams retrieved")
-                consecutive_errors += 1
                 continue
-
-            consecutive_errors = 0  # Reset on successful retrieval
 
             for t in teams:
                 team = t["team"]
-                form = t["form"][:2] if t["form"] else []
+                full_form = t["form"]
+
+                # ✅ CORRECT: ONLY LAST TWO MATCHES
+                last_two = full_form[-2:] if len(full_form) >= 2 else []
 
                 key = f"{season_id}:{team}"
                 previous = last_seen_form.get(key)
 
-                # Detect NEW D,D only
-                if form == ["D", "D"] and previous != ["D", "D"]:
+                if last_two == ["D", "D"] and previous != ["D", "D"]:
                     timestamp = datetime.now(TIMEZONE).strftime('%H:%M:%S')
-                    alert_msg = f"🚨 ALERT 🚨 | {team} has D,D | Season {season_id} | Time {timestamp}"
-                    logger.warning(alert_msg)
-                    print(alert_msg)  # Also print to stdout for visibility
+                    msg = f"🚨 ALERT 🚨 | {team} has LAST TWO = D,D | Season {season_id} | {timestamp}"
+                    logger.warning(msg)
+                    print(msg)
 
-                last_seen_form[key] = form
+                last_seen_form[key] = last_two
 
         except KeyboardInterrupt:
             logger.info("Monitor stopped by user")
             break
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
-            consecutive_errors += 1
-            time.sleep(60)  # Wait before retrying
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            time.sleep(60)
 
 
 if __name__ == "__main__":

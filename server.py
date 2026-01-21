@@ -57,34 +57,29 @@ def create_session():
     session.mount("https://", adapter)
     return session
 
-
-def get_actual_season(session):
-    """Get the actual (active) seasons and return the first one"""
+def get_latest_season(session):
+    """Get the latest season by ID (most recent)"""
     try:
         url = f"{BASE_URL}/seasons/list/actual"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
-        # Access items array
         items = data.get("items", [])
         if not items:
-            logger.error("No actual seasons returned in items")
+            logger.error("No seasons returned in items")
             return None
 
-        first_season = items[0]
-        season_id = first_season.get("id")
-        season_name = first_season.get("name", "Unknown")
-        logger.info(f"Using season: {season_name} | ID: {season_id}")
+        # pick season with highest ID (latest)
+        latest_season = max(items, key=lambda x: int(x["id"]))
+        season_id = latest_season.get("id")
+        season_name = latest_season.get("name", "Unknown")
+        logger.info(f"Using latest season: {season_name} | ID: {season_id}")
         return season_id
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch actual season: {e}")
+    except Exception as e:
+        logger.error(f"Failed to fetch latest season: {e}")
         return None
-    except (KeyError, IndexError) as e:
-        logger.error(f"Unexpected data structure in actual seasons: {e}")
-        return None
-
 
 def get_top5_team_forms(session, season_id):
     """Fetch top 5 teams and their forms"""
@@ -94,15 +89,12 @@ def get_top5_team_forms(session, season_id):
         r.raise_for_status()
         data = r.json()
 
-        if "competitionStandings" not in data or not data["competitionStandings"]:
-            logger.warning(f"No competition standings found for season {season_id}")
-            return []
-
-        if "participantStandings" not in data["competitionStandings"][0]:
+        standings = data.get("competitionStandings")
+        if not standings or not standings[0].get("participantStandings"):
             logger.warning(f"No participant standings found for season {season_id}")
             return []
 
-        teams = data["competitionStandings"][0]["participantStandings"][:5]
+        teams = standings[0]["participantStandings"][:5]
 
         return [
             {
@@ -111,13 +103,10 @@ def get_top5_team_forms(session, season_id):
             }
             for t in teams
         ]
-    except requests.exceptions.RequestException as e:
+
+    except Exception as e:
         logger.error(f"Failed to fetch standings: {e}")
         return []
-    except (KeyError, IndexError) as e:
-        logger.error(f"Unexpected data structure: {e}")
-        return []
-
 
 def sleep_until_next_check():
     """Align checks to 2 minutes after each 5-minute interval"""
@@ -137,7 +126,6 @@ def sleep_until_next_check():
         logger.error(f"Error in sleep_until_next_check: {e}")
         time.sleep(300)
 
-
 # ================= MAIN LOOP =================
 def main():
     logger.info("✅ Betpawa DD Monitor Started")
@@ -149,7 +137,7 @@ def main():
         try:
             sleep_until_next_check()
 
-            season_id = get_actual_season(session)
+            season_id = get_latest_season(session)
             if not season_id:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
@@ -166,9 +154,10 @@ def main():
 
             consecutive_errors = 0  # reset after successful retrieval
 
+            found_dd = False
             for t in teams:
                 team = t["team"]
-                form = t["form"][:2] if t["form"] else []
+                form = t["form"][-2:] if t["form"] else []  # last 2 matches
 
                 key = f"{season_id}:{team}"
                 previous = last_seen_form.get(key)
@@ -179,8 +168,12 @@ def main():
                     alert_msg = f"🚨 ALERT 🚨 | {team} has D,D | Season {season_id} | Time {timestamp}"
                     logger.warning(alert_msg)
                     print(alert_msg)
+                    found_dd = True
 
                 last_seen_form[key] = form
+
+            if not found_dd:
+                logger.info(f"No D,D found for top 5 teams in season {season_id}")
 
         except KeyboardInterrupt:
             logger.info("Monitor stopped by user")
@@ -189,7 +182,6 @@ def main():
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
             consecutive_errors += 1
             time.sleep(60)
-
 
 if __name__ == "__main__":
     main()

@@ -59,19 +59,20 @@ def create_session():
 
 
 def get_actual_season(session):
-    """Get the actual (active) seasons and return the first one (English League)"""
+    """Get the actual (active) seasons and return the first one"""
     try:
         url = f"{BASE_URL}/seasons/list/actual"
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
-        if not data or len(data) == 0:
-            logger.error("No actual seasons returned")
+        # Access items array
+        items = data.get("items", [])
+        if not items:
+            logger.error("No actual seasons returned in items")
             return None
 
-        # English League is always the first in the list
-        first_season = data[0]
+        first_season = items[0]
         season_id = first_season.get("id")
         season_name = first_season.get("name", "Unknown")
         logger.info(f"Using season: {season_name} | ID: {season_id}")
@@ -79,6 +80,9 @@ def get_actual_season(session):
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch actual season: {e}")
+        return None
+    except (KeyError, IndexError) as e:
+        logger.error(f"Unexpected data structure in actual seasons: {e}")
         return None
 
 

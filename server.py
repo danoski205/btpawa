@@ -6,6 +6,7 @@ A FastAPI server for automated triangular arbitrage trading on Bybit.
 Features:
 - CORS enabled for frontend communication
 - Async-safe exchange calls using run_in_executor
+- Real bid/ask pricing (not ticker last)
 - Proper error handling and logging
 - Trade history tracking
 - Input validation
@@ -14,6 +15,7 @@ Features:
 import asyncio
 import os
 import logging
+import random
 from datetime import datetime
 from typing import List, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor
@@ -49,10 +51,10 @@ BYBIT_SECRET = os.getenv("BYBIT_SECRET")
 DEMO_MODE = not BYBIT_KEY or not BYBIT_SECRET
 
 if DEMO_MODE:
-    logger.warning("⚠️  Running in DEMO MODE - No real trades will be executed")
+    logger.warning("Running in DEMO MODE - No real trades will be executed")
     logger.warning("   Set BYBIT_KEY and BYBIT_SECRET in .env for live trading")
 else:
-    logger.info("✅ Bybit credentials loaded - Live trading enabled")
+    logger.info("Bybit credentials loaded - Live trading enabled")
 
 # =====================================================
 # APP INIT
@@ -61,7 +63,7 @@ else:
 app = FastAPI(
     title="Arbitrage Bot API",
     description="Automated triangular arbitrage trading on Bybit",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # CORS Configuration - Allow frontend to connect
@@ -171,9 +173,9 @@ class Trader:
             })
             # Test connection
             self.exchange.load_markets()
-            logger.info("✅ Exchange connection established")
+            logger.info("Exchange connection established")
         except Exception as e:
-            logger.error(f"❌ Failed to connect to exchange: {e}")
+            logger.error(f"Failed to connect to exchange: {e}")
             self.exchange = None
 
     # -------------------------
@@ -190,7 +192,7 @@ class Trader:
         self.total_profit = 0.0
         self.last_error = None
         self.trade_history = []
-        logger.info(f"📋 Config set: amount={config.amount}, loops={config.loops}, steps={len(config.steps)}")
+        logger.info(f"Config set: amount={config.amount}, loops={config.loops}, steps={len(config.steps)}")
 
     # -------------------------
     # STATUS
@@ -220,7 +222,7 @@ class Trader:
     def stop(self):
         """Stop the bot gracefully"""
         self.running = False
-        logger.info("🛑 Stop signal received")
+        logger.info("Stop signal received")
 
     def reset(self):
         """Reset the bot state"""
@@ -231,7 +233,7 @@ class Trader:
         self.loops_completed = 0
         self.last_error = None
         self.trade_history = []
-        logger.info("🔄 Bot state reset")
+        logger.info("Bot state reset")
 
     # -------------------------
     # ASYNC EXCHANGE CALLS
@@ -242,7 +244,7 @@ class Trader:
         loop = asyncio.get_event_loop()
         
         if DEMO_MODE:
-            # Demo mode: return simulated prices
+            # Demo mode: return simulated prices with bid/ask
             return await self._get_demo_ticker(symbol)
         
         return await loop.run_in_executor(
@@ -251,12 +253,36 @@ class Trader:
             symbol
         )
 
+    async def _get_trade_price(self, symbol: str, side: str) -> float:
+        """
+        Returns the REAL executable price:
+        - buy  -> ask (what sellers want)
+        - sell -> bid (what buyers offer)
+        
+        This is critical for accurate arbitrage calculations.
+        Using ticker["last"] causes fake profits due to spread blindness.
+        """
+        ticker = await self._fetch_ticker(symbol)
+        
+        bid = ticker.get("bid")
+        ask = ticker.get("ask")
+        
+        # Validate liquidity exists
+        if bid is None or ask is None:
+            raise Exception(f"No bid/ask liquidity for {symbol}")
+        
+        # Log the spread for debugging
+        spread_percent = ((ask - bid) / bid) * 100
+        logger.debug(f"{symbol} spread: {spread_percent:.4f}% (bid={bid}, ask={ask})")
+        
+        return ask if side == "buy" else bid
+
     async def _create_order(self, symbol: str, side: str, amount: float) -> dict:
         """Create market order asynchronously (non-blocking)"""
         loop = asyncio.get_event_loop()
         
         if DEMO_MODE:
-            # Demo mode: simulate order
+            # Demo mode: simulate order with real bid/ask
             return await self._simulate_order(symbol, side, amount)
         
         return await loop.run_in_executor(
@@ -265,8 +291,11 @@ class Trader:
         )
 
     async def _get_demo_ticker(self, symbol: str) -> dict:
-        """Generate demo ticker prices"""
-        # Simulated prices for demo mode
+        """
+        Generate demo ticker prices with realistic bid/ask spread.
+        Simulates a 0.1% spread to match real market conditions.
+        """
+        # Base prices for demo mode
         demo_prices = {
             "BTC/USDT": 42000.0,
             "ETH/USDT": 2200.0,
@@ -276,28 +305,58 @@ class Trader:
             "XRP/USDT": 0.62,
             "SOL/USDT": 98.0,
             "DOGE/USDT": 0.082,
+            "ADA/USDT": 0.45,
+            "AVAX/USDT": 35.0,
+            "MATIC/USDT": 0.85,
+            "DOT/USDT": 7.20,
+            "LINK/USDT": 14.50,
+            "UNI/USDT": 6.80,
+            "ATOM/USDT": 9.50,
         }
         
-        price = demo_prices.get(symbol.upper(), 100.0)
-        # Add small random variance for realism
-        import random
-        variance = price * random.uniform(-0.001, 0.001)
+        mid_price = demo_prices.get(symbol.upper(), 100.0)
         
-        return {"last": price + variance, "symbol": symbol}
+        # Add small random variance for realism (0.05% max)
+        variance = mid_price * random.uniform(-0.0005, 0.0005)
+        mid_price += variance
+        
+        # Simulate realistic spread (0.1% total, split between bid and ask)
+        spread = mid_price * 0.001
+        
+        return {
+            "symbol": symbol,
+            "last": mid_price,
+            "bid": mid_price - (spread / 2),   # What buyers are willing to pay
+            "ask": mid_price + (spread / 2),   # What sellers want
+            "high": mid_price * 1.02,
+            "low": mid_price * 0.98,
+            "volume": random.uniform(1000, 50000)
+        }
 
     async def _simulate_order(self, symbol: str, side: str, amount: float) -> dict:
-        """Simulate an order in demo mode"""
-        ticker = await self._get_demo_ticker(symbol)
-        price = ticker["last"]
+        """
+        Simulate an order in demo mode using real bid/ask prices.
+        This ensures demo mode accurately reflects live trading costs.
+        """
+        # Use the real executable price (bid for sell, ask for buy)
+        price = await self._get_trade_price(symbol, side)
+        
+        if side == "buy":
+            cost = amount * price
+            filled = amount
+        else:
+            cost = amount * price
+            filled = amount
         
         return {
             "id": f"demo_{datetime.now().timestamp()}",
             "symbol": symbol,
             "side": side,
-            "amount": amount,
+            "amount": filled,
             "price": price,
-            "cost": amount * price if side == "sell" else amount / price,
-            "status": "closed"
+            "cost": cost,
+            "status": "closed",
+            "type": "market"
         }
 
     # -------------------------
@@ -307,14 +366,15 @@ class Trader:
     async def simulate_cycle(self, amount: float) -> float:
         """
         Simulate an arbitrage cycle to check profitability.
+        Uses real bid/ask prices for accurate profit calculation.
         Returns the expected ending balance.
         """
         balance = amount
         
         for step in self.config.steps:
             try:
-                ticker = await self._fetch_ticker(step.symbol)
-                price = ticker["last"]
+                # Use real executable price (ask for buy, bid for sell)
+                price = await self._get_trade_price(step.symbol, step.side)
                 
                 if step.side == "buy":
                     # Buying: spend quote currency, receive base currency
@@ -336,14 +396,15 @@ class Trader:
     async def execute_cycle(self, cycle_num: int, amount: float) -> float:
         """
         Execute a full arbitrage cycle.
+        Uses real bid/ask prices for accurate execution.
         Returns the ending balance.
         """
         balance = amount
 
         for step_idx, step in enumerate(self.config.steps):
             try:
-                ticker = await self._fetch_ticker(step.symbol)
-                price = ticker["last"]
+                # Use real executable price (ask for buy, bid for sell)
+                price = await self._get_trade_price(step.symbol, step.side)
 
                 # Calculate quantity based on side
                 if step.side == "buy":
@@ -384,7 +445,7 @@ class Trader:
 
             except Exception as e:
                 self.last_error = f"Trade failed: {step.symbol} {step.side} - {str(e)}"
-                logger.error(f"❌ {self.last_error}")
+                logger.error(f"Trade error: {self.last_error}")
                 raise
 
         return balance
@@ -399,7 +460,7 @@ class Trader:
             logger.error("No configuration set")
             return
 
-        logger.info("🚀 Bot starting...")
+        logger.info("Bot starting...")
         logger.info(f"   Initial balance: {self.current_balance}")
         logger.info(f"   Loops to run: {self.loops_left}")
         logger.info(f"   Min profit: {self.config.min_profit_percent}%")
@@ -410,9 +471,9 @@ class Trader:
             cycle_num = self.loops_completed + 1
             
             try:
-                logger.info(f"📊 Cycle {cycle_num} | Balance: {self.current_balance:.8f}")
+                logger.info(f"Cycle {cycle_num} | Balance: {self.current_balance:.8f}")
 
-                # First, simulate to check profitability
+                # First, simulate to check profitability (uses bid/ask)
                 simulated = await self.simulate_cycle(self.current_balance)
                 
                 profit_percent = ((simulated - self.current_balance) / self.current_balance) * 100
@@ -421,11 +482,11 @@ class Trader:
 
                 # Check if profitable enough
                 if profit_percent < self.config.min_profit_percent:
-                    logger.info(f"⏸️  Profit {profit_percent:.4f}% below threshold {self.config.min_profit_percent}%. Waiting...")
+                    logger.info(f"Profit {profit_percent:.4f}% below threshold {self.config.min_profit_percent}%. Waiting...")
                     await asyncio.sleep(1)  # Wait and retry
                     continue
 
-                # Execute the cycle
+                # Execute the cycle (uses bid/ask)
                 new_balance = await self.execute_cycle(cycle_num, self.current_balance)
 
                 # Update tracking
@@ -435,19 +496,19 @@ class Trader:
                 self.loops_left -= 1
                 self.loops_completed += 1
 
-                logger.info(f"✅ Cycle {cycle_num} complete | Profit: {cycle_profit:+.8f} | Total: {self.total_profit:+.8f}")
+                logger.info(f"Cycle {cycle_num} complete | Profit: {cycle_profit:+.8f} | Total: {self.total_profit:+.8f}")
 
                 # Small delay between cycles
                 await asyncio.sleep(0.5)
 
             except Exception as e:
                 self.last_error = str(e)
-                logger.error(f"❌ Cycle {cycle_num} failed: {e}")
+                logger.error(f"Cycle {cycle_num} failed: {e}")
                 # Continue to next cycle after error
                 await asyncio.sleep(1)
 
         self.running = False
-        logger.info("🏁 Bot stopped")
+        logger.info("Bot stopped")
         logger.info(f"   Final balance: {self.current_balance:.8f}")
         logger.info(f"   Total profit: {self.total_profit:+.8f}")
         logger.info(f"   Cycles completed: {self.loops_completed}")
@@ -471,7 +532,7 @@ def health():
         "status": "online",
         "message": "Arbitrage bot running",
         "demo_mode": DEMO_MODE,
-        "version": "2.0.0"
+        "version": "2.1.0"
     }
 
 
@@ -536,16 +597,24 @@ def get_trades(limit: int = 50):
 
 @app.get("/prices", tags=["Market"])
 async def get_prices(symbols: str = "BTC/USDT,ETH/USDT,ETH/BTC"):
-    """Get current prices for symbols (comma-separated)"""
+    """Get current bid/ask prices for symbols (comma-separated)"""
     symbol_list = [s.strip().upper() for s in symbols.split(",")]
     prices = {}
     
     for symbol in symbol_list:
         try:
             ticker = await bot._fetch_ticker(symbol)
-            prices[symbol] = ticker["last"]
+            prices[symbol] = {
+                "bid": ticker.get("bid"),
+                "ask": ticker.get("ask"),
+                "last": ticker.get("last"),
+                "spread_percent": round(
+                    ((ticker.get("ask", 0) - ticker.get("bid", 0)) / ticker.get("bid", 1)) * 100, 
+                    4
+                ) if ticker.get("bid") else None
+            }
         except Exception as e:
-            prices[symbol] = None
+            prices[symbol] = {"error": str(e)}
             logger.warning(f"Failed to fetch price for {symbol}: {e}")
     
     return {"prices": prices, "demo_mode": DEMO_MODE}
@@ -558,13 +627,14 @@ async def get_prices(symbols: str = "BTC/USDT,ETH/USDT,ETH/BTC"):
 @app.on_event("startup")
 async def startup_event():
     logger.info("=" * 50)
-    logger.info("🤖 Arbitrage Bot Server Starting")
+    logger.info("Arbitrage Bot Server Starting")
     logger.info(f"   Demo Mode: {DEMO_MODE}")
+    logger.info(f"   Version: 2.1.0 (bid/ask pricing)")
     logger.info("=" * 50)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("👋 Server shutting down...")
+    logger.info("Server shutting down...")
     bot.stop()
     executor.shutdown(wait=True)

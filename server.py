@@ -175,7 +175,7 @@ class Trader:
                 "apiKey": BYBIT_KEY,
                 "secret": BYBIT_SECRET,
                 "enableRateLimit": True,
-                "options": {"defaultType": "linear"}
+                "options": {"defaultType": "spot"}
             })
 
             if USE_TESTNET:
